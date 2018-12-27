@@ -1,0 +1,248 @@
+---
+title: "Predicting Job Salary"
+author: "Vignesh J Muralidharan"
+date: "October 13 2018"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+#Introduction
+This task is known as a regression problem, one where the response variable Y is continuous in nature. This problem interestingly only has categorical variables that are difficult to process. The main focus of this part will be in checking different features and methods of extraction to improve results. Two languages were used and contrasted for this task to create a linear model from the features. Two methods were explored: bag of words and aggregation.
+The data consists of the following information: * Id - A unique identifier for each job ad
+. Title - A freetext field supplied to us by the job advertiser as the Title of the job ad. 
+. FullDescription - The full text of the job ad as provided by the job advertiser. 
+. LocationRaw - The freetext location as provided by the job advertiser.
+. LocationNormalized - Adzuna's normalised location from within our own location tree, 
+. ContractType - full_time or part_time, interpreted by Adzuna from description 
+. ContractTime - permanent or contract, interpreted by Adzuna from description 
+. Company - the name of the employer as supplied to us by the job advertiser.
+. Category - which of 30 standard job categories this ad fits into, inferred in a very messy way based on the source 
+. SalaryRaw - the freetext salary field we received in the job advert from the advertiser.
+. SalaryNormalised - the annualised salary interpreted by Adzuna from the raw salary. Note that is always a single value 
+. SourceName - the name of the website or advertiser from whom we received the job advert.
+
+```{r,message=FALSE}
+library(plyr) ; library(stringr) ; library(caret) ; library(car)
+library(class) ; library(knitr) ; library(MASS) ; library(e1071)
+library(glmnet) ; library(pls) ; library(mice)
+```
+
+##**1.Reading data into r and converting some variables into factors**
+
+```{r}
+sdata=read.csv("https://raw.githubusercontent.com/vigneshjmurali/Statistical-Predictive-Modelling/master/Datasets/Project%201_Dataset_1_salary_uk.csv") 
+table(sdata$Category)
+sdata$Title<- as.factor(sdata$Title)
+sdata$FullDescription<- as.factor(sdata$FullDescription)
+sdata$ContractType[sdata$ContractType=='']<-NA
+sdata$ContractType <- as.factor(sdata$ContractType)
+sdata$ContractTime[sdata$ContractTime=='']<-NA
+sdata$ContractTime <- as.factor(sdata$ContractTime)
+sdata$Category <- as.factor(sdata$Category)
+sdata$SourceName <- as.factor(sdata$SourceName)
+sdata$Company <- as.factor(sdata$Company)
+sdata$LocationNormalized <- as.factor(sdata$LocationNormalized)
+sdata<-subset(sdata,select = -c(SalaryRaw))  ##delete 'SalaryRaw'
+```
+
+##**2.Data Cleaning**
+##### **Aggregating Titles into three levels:Senior, Mid-Level,Junior**
+
+```{r}
+sdata$Tlevel<-"Mid-Level"
+for(i in 1:length(sdata$Title)){
+  if(grepl('Director', sdata[i,3],ignore.case=TRUE)|grepl("Senior",sdata[i,2] , ignore.case = TRUE)| grepl("Manager",sdata[i,2] , ignore.case = TRUE) | grepl("Head",sdata[i,2] , ignore.case = TRUE) | 
+grepl("Chef",sdata[i,2] , ignore.case = TRUE) | grepl("Lead",sdata[i,2] , ignore.case = TRUE)){
+    sdata$Tlevel [i]<- "Senior"
+  }
+  else if (grepl("Junior",sdata[i,2] ,ignore.case = TRUE) |
+           grepl("Entry",sdata[i,2] , ignore.case = TRUE))
+  {
+    sdata$Tlevel[i]<- "Junior"
+  }
+  else{
+    sdata$Tlevel[i]<- "Mid-Level"
+  }
+}
+```
+###### **Diveding locations into two levels, London label as 1, others as 0**
+```{r,message=FALSE,error=TRUE}
+myurl<-'https://docs.google.com/spreadsheets/d/e/2PACX-1vQXzU41Zv3GwB5s_YJQsrLdSnMt2isMWj03ZZ910sLel_vL9ZtsyROewGegGZDkmwgYYa1FMw2tWzKl/pub?gid=1568496122&single=true&output=csv'
+tree1 <- read.csv(url(myurl),header = FALSE)
+tree<-as.vector(tree1[,'V1'])
+for (i in 1:nrow(sdata)) {
+  # get city name
+  loc <- sdata$LocationNormalized[i]
+  # find the first line in the tree in which that city name appears
+  line.id <- which(grepl(loc, tree))[1]
+  # use regular expressions to pull out the broad location
+  r <- regexpr("~.+?~", tree[line.id])
+  match <- regmatches(tree[line.id], r)
+  # store the broad location
+  sdata$Location[i] <- gsub("~", "", match)  #Error: replacement has length zero
+}
+sdata$Location <- as.factor(sdata$Location)
+table(sdata$Location)
+# label London as 1, non-London as 0
+sdata$Location <- as.factor(ifelse(sdata$Location == "London", 1, 0)) 
+```
+#### **Since there are so many different companies. I have no idea how to aggregate them into levles. I just label Top 50 companies as 1, others as 0.**
+```{r}
+company.counts <- summary(sdata$Company)
+top.company <- names(company.counts[order(company.counts, decreasing= TRUE)][1:50])
+sdata$TopCom <- factor(sdata$Company, levels=top.company)
+sdata$TopCom[sdata$TopCom == ""] <-NA
+sdata$TopCom <- as.factor(ifelse(is.na(sdata$TopCom), 0, 1))
+```
+#####**Creating an aggregate category: WhiteCollar=(Accounting, Engineering, Legal, IT, Cosultancy,HR)**
+##### **WhiteCollar labels 1, others label 0**
+```{r}
+sdata$WhiteCollar <- grepl('IT', sdata$Category) | grepl('Engineer', sdata$Category) |
+grepl('Finance', sdata$Category) | grepl('Legal', sdata$Category) | grepl('Consult', sdata$Category)|
+grepl('HR', sdata$Category)
+sdata$WhiteCollar <- as.factor(ifelse(sdata$WhiteCollar == "TRUE", 1, 0))
+```
+
+#####**Dividing 'SourceName' into two levels, Top 5 Source lables 1, others label 0**
+```{r}
+sources.counts <- summary(sdata$SourceName)
+top5.sources <- names(sources.counts[order(sources.counts, decreasing= TRUE)][1:5])
+sdata$Top5Source <- factor(sdata$Source, levels=top5.sources)
+sdata$Top5Source <- as.factor(ifelse(is.na(sdata$Top5Source), 0, 1))
+```
+
+#####**Dropping previously modified attributes and attributes that will not be used**
+```{r}
+sdata1<-subset(sdata,select = -c(Id,Title,FullDescription,LocationRaw,LocationNormalized,
+                                 Company,Category,SourceName))
+```
+####**Randomly dividing the clean data set into two sets of labels 1 (training data) and 2(test data). Here I used mice package to impute missing values to variable 'contractType' and 'contractTime' in these two sets seperately. I tried to impute the missing values for the whole data set  but failed as the size of the data set is too large.**
+
+#Baseline
+Having a baseline and a method of classifying success is equally as important in a regression model as with classification. In this case, it was decided that the root mean squared error (RMSE) would provide the most meaningful insight into the quality of the model. The works by calculating the difference between the expected outcome and the predicted outcome, squaring it, averaging that quantity and taking the square root.
+$$\text{RMSE} =  \sqrt{\frac{1}{n}\sum_{i=1}^n \left( \hat{Y}_i - Y_i \right)^2}$$
+
+```{r,results='hide'}
+set.seed(2344)
+n=10000
+idx=sample(1:2,n,repl=T)
+ss1<-sdata1[idx==1,]
+ss_mod1=mice(ss1[, !names(ss1) %in% "SalaryNormalized"], 
+             method = c("polyreg", "polyreg", "", "" , "", "", ""))
+ss11<-cbind(complete(ss_mod1),SalaryNormalized=ss1[,'SalaryNormalized'])
+ss2<-sdata1[idx==2,]
+ss_mod2=mice(ss2[, !names(ss2) %in% "SalaryNormalized"], 
+             method = c("polyreg", "polyreg", "", "" , "", "", ""))
+ss22<-cbind(complete(ss_mod2),SalaryNormalized=ss2[,'SalaryNormalized'])
+set.seed(1234)
+n=10000
+idx2=sample(1:2,n,repl=T)
+sdata2=rbind(ss11,ss22)
+sdata1.train<-sdata2[idx2==1,]  #training set
+sdata1.test<-sdata2[idx2==2,]  #testing set
+```
+
+##**3.Linear regression**
+The primary method for developing this model hinges on linear regression and shaping the features such that
+the linear regression model can best fit them
+```{r}
+# Load  function
+sdata.lm = lm(formula = SalaryNormalized ~ ., data = sdata1.train)
+summary(sdata.lm)
+lm_full <- sdata.lm  # full model is the model just fitted
+lm_null <- lm(SalaryNormalized ~ 1, data = sdata1.train)
+# backward selection
+step(lm_full, trace = F, scope = list(lower=formula(lm_null), upper=formula(lm_full)),
+     direction = 'backward')
+# forward selection
+step(lm_null, trace = F, scope = list(lower=formula(lm_null), upper=formula(lm_full)),
+     direction = 'forward')
+##Predict using the model
+lm.pred <- predict(sdata.lm , newdata = sdata1.test)
+lm.RMSE<-sqrt(mean((lm.pred - sdata1.test$SalaryNormalized)^2))  #RMSE value, the smaller the better
+lm.RMSE
+```
+####**Both backward and forward selection shows that no variables was dropped, so I used the full model to make the prediction.The result above shows that RMSE=14644.16.**
+
+##**4.Trying modeling log-transformation of the response:** log(SalaryNormalized)
+```{r}
+log.lm <- lm(log(SalaryNormalized) ~., data=sdata1.train)
+summary(log.lm)
+log.pred <- predict(log.lm , newdata = sdata1.test)
+log.RMSE<-sqrt(mean((exp(log.pred) - sdata1.test$SalaryNormalized)^2))  #RMSE value, the smaller the better
+log.RMSE
+```
+####**After log transformation to the response, the RMSE=14857.66 has increased compared to the model without transformation. This means that log transformation didn't help.**
+
+##**5.Ridge Regression**
+```{r}
+library(glmnet)
+#training set
+x.train <- model.matrix(SalaryNormalized ~., data = sdata1.train)[, -1]
+y.train <- sdata1.train$SalaryNormalized
+# test set
+x.test <- model.matrix(SalaryNormalized ~., data = sdata1.test)[, -1]
+y.test <- sdata1.test$SalaryNormalized
+#  obtain best lambda
+set.seed(1)
+ri.lambda<- cv.glmnet(x.train, y.train, alpha = 0)
+plot(ri.lambda)
+# predict test set using best lambda and calculate RMSE
+ridge.fit <- glmnet(x.train, y.train, alpha = 0)
+plot(ridge.fit, xvar = "lambda", label = TRUE)
+ridge.pred <- predict(ridge.fit, s = ri.lambda$lambda.min, newx = x.test)
+ridge.RMSE<-sqrt(mean((ridge.pred - y.test)^2))
+```
+####**After using Ridge Regression to fit the data, we can see that   RMSE= 14643.47 decreased a little bit compared to that of the linear regression.**
+
+##**6.The Lasso Regression**
+```{r}
+set.seed(1)
+lasso.fit=glmnet(x.train,y.train,alpha=1)
+plot(lasso.fit)
+#  obtain best lambda
+la.lambda=cv.glmnet(x.train,y.train,alpha=1)
+plot(la.lambda)
+# predict test set using best lambda and calculate RMSE
+lasso.pred=predict(lasso.fit,s=la.lambda$lambda.min,newx=x.test)
+lasso.RMSE<-sqrt(mean((lasso.pred - y.test)^2))
+```
+####**he result above showed us that RMSE= 14642.78 is very close to that of  Ridge Regression.**
+
+##**7.Principal Components Regression**
+```{r}
+set.seed(2)
+pcr.fit=pcr(SalaryNormalized~., data=sdata1.train,scale=TRUE, validation="CV")
+summary(pcr.fit)
+validationplot(pcr.fit,val.type="MSEP")
+set.seed(1)
+# predict test set using M=8 and calculate RMSE
+pcr.pred=predict(pcr.fit,x.test,ncomp=8)
+pcr.RMSE<-sqrt(mean((pcr.pred - y.test)^2))
+```
+####**The lowest crossvalidation error occurs when there are M = 8 components;  RMSE=14644.16, which means Principal Components Regression performed just like linear regression.**
+
+##**8.Partial Least Squares**
+```{r}
+set.seed(1)
+pls.fit=plsr(SalaryNormalized~., data=sdata1.train,scale=TRUE, validation="CV")
+summary(pls.fit)
+validationplot(pls.fit,val.type="MSEP")
+#The lowest cross-validation error occurs when n = 7 partial least squares directions are used
+pls.pred=predict(pls.fit,x.test,ncomp=7 )
+pls.RMSE<-sqrt(mean((pls.pred - y.test)^2))
+```
+####**For Partial Least Squares,the lowest cross-validation error occurs when n = 7 partial least squares directions are used. RMSE=14644.56, which is approximately equal to that of linear regression.**
+
+##**9.Summary**
+```{r}
+# RMSE summary
+RMSE <- rbind(lm.RMSE,log.RMSE,ridge.RMSE,lasso.RMSE,pcr.RMSE,pls.RMSE)
+rownames(RMSE) <- (c('Linear Regression', 'Linear Regression(log transform)','Ridge Regression', 
+                     'The Lasso','Principal Components Regression','Partial Least Squares'))
+colnames(RMSE) <- 'RMSE'
+round(RMSE, 4)
+```
+####**From the output above, we cann see that of all the methods that I used,  Linear Regression with log transformation performed the worse, while The Lasso performed the best of all. And all the RMSE are pretty close.**
